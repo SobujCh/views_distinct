@@ -1,0 +1,8 @@
+name: Views Distinct
+type: module
+description: Allows filtering "distinct" Views result rows based on arbitrary fields.
+package: Views
+#core: 8.x
+core_version_requirement: ^8.8 || ^9 || ^10
+dependencies:
+  - drupal:views

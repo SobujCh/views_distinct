@@ -1,0 +1,378 @@
+<?php
+/**
+ * @file
+ * Allow filtering Views results based on arbitrary distinct fields.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\views\Entity\View;
+use Drupal\views\ViewExecutable;
+use Drupal\views_ui\ViewUI;
+
+/**
+ * Implements hook_help().
+ */
+function views_distinct_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.views_distinct':
+      $output = '';
+      $output .= '<h3>' . t('Views Distinct') . '</h3>';
+      $output .= '<p>' . t('This Views Distinct module aims to give a simple GUI method to remove rows. For more information, see the <a href=":big_pipe-documentation">online documentation for the Views Distinct module</a>.', [':big_pipe-documentation' => 'https://www.drupal.org/project/views_distinct']) . '</p>';
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Alter all field config forms to add filtering options.
+ */
+function views_distinct_form_views_ui_config_item_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // Only apply our logic to field configurations.
+  if ($form_state->get('type') !== 'field') {
+    return;
+  }
+
+  $view_ui = $form_state->get('view');
+  $display_id = $form_state->get('display_id');
+  $field_id = $form_state->get('id');
+  $default_values = _views_distinct_field_settings_get($view_ui, $field_id, $display_id);
+
+  $form['options']['views_distinct'] = [
+    '#type' => 'details',
+    '#title' => t('Views Distinct settings'),
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+  ];
+
+  $form['options']['views_distinct_filter_action'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Filter this field'),
+    '#description' => t('Filter (remove) result rows based on repetition of this field value. If a field handler applies special post-query formatting (such as the User Name handler that creates links to profiles).'),
+    '#default_value' => $default_values['filter_action'],
+    '#fieldset' => 'views_distinct',
+  ];
+
+  $form['options']['views_distinct_post_render'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Use the rendered output of this field'),
+    '#description' => t('Filter based on the rendered output of this field, including any Rewrite Results changes.'),
+    '#default_value' => $default_values['post_render'],
+    '#fieldset' => 'views_distinct',
+    '#states' => [
+      'visible' => [
+        'input[name="options[views_distinct_filter_action]"]' => ['checked' => TRUE],
+      ],
+    ],
+  ];
+
+  // Add our own submit handler, executed before standardSubmit().
+  array_unshift($form['actions']['submit']['#submit'], 'views_distinct_form_views_ui_config_item_form_submit');
+}
+
+/**
+ * Submit handler for the views_ui_config_item form.
+ */
+function views_distinct_form_views_ui_config_item_form_submit($form, FormStateInterface $form_state) {
+  $form_state_values = $form_state->getValues();
+  $view_ui = $form_state->get('view');
+  $display_id = $form_state->get('display_id');
+  $field_id = $form_state->get('id');
+  $settings = [];
+  $override_display_id = NULL;
+  $views_distinct_keys = [
+    'views_distinct_post_render' => 'post_render',
+    'views_distinct_filter_action' => 'filter_action',
+  ];
+
+  // Only set $override_display_id if such a thing was submitted.
+  if (isset($form_state_values['override']) && !empty($form_state_values['override'])) {
+    $override_display_id = reset($form_state_values['override']);
+  }
+
+  // Check if we're configuring this field for *this display only* or for all
+  // displays.
+  if ($override_display_id === 'default_revert') {
+    // Delete any existing $display_id settings.
+    _views_distinct_field_settings_delete($view_ui, $field_id, $display_id);
+  }
+  elseif (($override_display_id !== $display_id && $override_display_id === 'default') || $override_display_id === '') {
+    // In this case we are setting the configuration for a different display,
+    // so we'll actually store the setting on the overridden display name
+    // (probably this is "default"/All Displays). We also need to remove any
+    // setting we've stored for the actual $display_id, since that no longer
+    // applies (the user has chosen to NOT override the default settings,
+    // which would be the only reason to store $display_id-specific settings).
+    // Delete any existing $display_id settings.
+    _views_distinct_field_settings_delete($view_ui, $field_id, $display_id);
+
+    // Update $display_id so later code will act on the right setting storage.
+    $display_id = $override_display_id;
+  }
+
+  // Prepares an array of settings.
+  foreach ($views_distinct_keys as $input_key => $config_key) {
+    if (isset($form_state_values['options'][$input_key])) {
+      $settings[$config_key] = $form_state_values['options'][$input_key];
+    }
+  }
+
+  _views_distinct_field_settings_set($view_ui, $field_id, $display_id, $settings);
+}
+
+/**
+ * Implements hook_views_post_execute().
+ *
+ * Filter through results and remove duplicates based on fields.
+ * We use hook_views_post_execute instead of hook_views_pre_render in order to
+ * de-dupe before the pager/etc. is built. Post-execute is the first opportunity
+ * to check the results, so we do it then.
+ * In this post_execute phase, we only have access to the fields as SQL result
+ * rows, so there's not a lot of magic we can do except munge the actual SQL
+ * $view->result array based on the field definitions here.
+ */
+function views_distinct_views_post_execute(ViewExecutable $view) {
+  // Get the query fields that will need filtering.
+  $fields = _views_distinct_get_fields($view);
+  $filtered_sql_fields = $fields['filtered_fields']['pre_render'];
+
+  // Check if we have any action we need to take (there are rows to filter).
+  if (empty($filtered_sql_fields)) {
+    return;
+  }
+
+  // Iterate each result and removing dupes.
+  $filtered_sql_fields_list = array_keys($filtered_sql_fields);
+  foreach ($view->result as $row_index => $row) {
+    foreach ($filtered_sql_fields_list as $sql_field) {
+      if (isset($row->$sql_field)) {
+        $value = $row->{$sql_field};
+
+        if (!empty($filtered_sql_fields[$sql_field][$value])) {
+          // This is a repeated row!
+          unset($view->result[$row_index]);
+          --$view->total_rows;
+        }
+
+        $filtered_sql_fields[$sql_field][$value] = TRUE;
+      }
+      else {
+        // Use this workaround for fields where a value cannot be fetched as
+        // a value of the row.
+        if ($row->_entity instanceof EntityInterface) {
+          $entity_id = $row->_entity->id();
+
+          if (!empty($filtered_sql_fields[$sql_field][$entity_id])) {
+            // This is a repeated row!
+            unset($view->result[$row_index]);
+            --$view->total_rows;
+          }
+
+          $filtered_sql_fields[$sql_field][$entity_id] = TRUE;
+        }
+      }
+    }
+  }
+
+  // Update the pager, if we're using one. Note: this only updates the page
+  // count that the pager displays, and even that it does not do fully:
+  // at most we will only be reducing $view->total_rows by (N - 1) where N is
+  // the per-page count of items, which may not affect the "total pages"
+  // sufficiently.  For example, if each pager page is showing 10 items, and
+  // we filter rows 1-9 into row 0, we've removed 9 rows.  If the total
+  // results for the query was 100 (even if they all end up being duplicates as
+  // well! We can't know at this point), which is 10 pages, our "fixed" result
+  // count would be "91", which would still show 10 pages.  In reality, once all
+  // dupes are filtered, we may only have 2 pages.
+  if ($view->usePager()) {
+    $view->pager->total_items = $view->total_rows;
+    $view->pager->updatePageInfo();
+  }
+}
+
+/**
+ * Implements hook_preprocess_HOOK().
+ *
+ * We only use this hook when we need to use rendered output to remove dupes.
+ */
+function views_distinct_preprocess_views_view(&$variables) {
+  $view = &$variables['view'];
+  // Get the query fields that will need filtering.
+  $fields = _views_distinct_get_fields($view);
+  $filtered_sql_fields = $fields['filtered_fields']['post_render'];
+
+  // Check if we have any action we need to take (there are rows to filter).
+  if (empty($filtered_sql_fields)) {
+    return;
+  }
+
+  // Iterate each result and removing dupes.
+  $filtered_sql_fields_list = array_keys($filtered_sql_fields);
+  foreach ($view->result as $row_index => $row) {
+    foreach ($filtered_sql_fields_list as $sql_field) {
+      $fieldMarkup = $view->style_plugin->getField($row_index, $sql_field);
+
+      if ($fieldMarkup !== NULL) {
+        $value = (string) $fieldMarkup;
+
+        if (!empty($filtered_sql_fields[$sql_field][$value])) {
+          // This is a repeated row!
+          unset($view->result[$row_index]);
+          --$view->total_rows;
+        }
+
+        $filtered_sql_fields[$sql_field][$value] = TRUE;
+      }
+    }
+  }
+
+  // Update the pager, if we're using one. Note: this only updates the page
+  // count that the pager displays, and even that it does not do fully:
+  // at most we will only be reducing $view->total_rows by (N - 1) where N is
+  // the per-page count of items, which may not affect the "total pages"
+  // sufficiently.  For example, if each pager page is showing 10 items, and
+  // we filter rows 1-9 into row 0, we've removed 9 rows.  If the total
+  // results for the query was 100 (even if they all end up being duplicates as
+  // well! We can't know at this point), which is 10 pages, our "fixed" result
+  // count would be "91", which would still show 10 pages.  In reality, once all
+  // dupes are filtered, we may only have 2 pages.
+  if ($view->usePager()) {
+    $view->pager->total_items = $view->total_rows;
+    $view->pager->updatePageInfo();
+  }
+
+  $variables['rows'] = $view->style_plugin->render();
+}
+
+/**
+ * Utility function to centralize default field settings.
+ *
+ * @return array
+ *   An array of default settings (filter_action, post_render).
+ */
+function _views_distinct_field_settings_defaults() {
+  return [
+    'filter_action' => 0,
+    'post_render' => 0,
+  ];
+}
+
+/**
+ * Utility function to get field settings or their defaults.
+ *
+ * @param $view
+ *   A view configuration entity or object stores UI related temporary settings.
+ * @param string $field_id
+ *   Machine name of the field currently being rendered/edited.
+ * @param string $display_id
+ *   (optional) Machine name of the display currently being rendered/edited.
+ *
+ * @return array
+ *   An array of default settings (filter_action, post_render).
+ */
+function _views_distinct_field_settings_get($view, string $field_id, string $display_id = 'default') {
+  if (!($view instanceof View) || !($view instanceof ViewUI)) {
+    \Drupal::logger('views_distinct')->notice('Cannot use view object to get third party settings.');
+  }
+
+  $third_party_settings = $view->getThirdPartySetting('views_distinct', 'settings');
+
+  if (isset($third_party_settings[$display_id][$field_id])) {
+    return $third_party_settings[$display_id][$field_id];
+  }
+
+  if (isset($third_party_settings['default'][$field_id])) {
+    return $third_party_settings['default'][$field_id];
+  }
+
+  return _views_distinct_field_settings_defaults();
+}
+
+/**
+ * Utility function to update field settings.
+ *
+ * @param \Drupal\views_ui\ViewUI $view_ui
+ *   Stores UI related temporary settings.
+ * @param string $field_id
+ *   Machine name of the field currently being rendered/edited.
+ * @param string $display_id
+ *   (optional) Machine name of the display currently being rendered/edited.
+ * @param array $settings
+ *   (optional) Array of new settings to store.
+ */
+function _views_distinct_field_settings_set(ViewUI $view_ui, string $field_id, string $display_id = 'default', array $settings = []) {
+  if ($settings['filter_action'] === 0) {
+    $settings = _views_distinct_field_settings_defaults();
+  }
+  else {
+    // Updating the stored third party settings.
+    $settings = $settings + _views_distinct_field_settings_defaults();
+  }
+
+  $third_party_settings = $view_ui->getThirdPartySetting('views_distinct', 'settings');
+  $third_party_settings[$display_id][$field_id] = $settings;
+  $view_ui->setThirdPartySetting('views_distinct', 'settings', $third_party_settings);
+}
+
+/**
+ * Utility function to delete field settings.
+ *
+ * @param \Drupal\views_ui\ViewUI $view_ui
+ *   Stores UI related temporary settings.
+ * @param string $field_id
+ *   Machine name of the field currently being rendered/edited.
+ * @param string $display_id
+ *   (optional) Machine name of the display currently being rendered/edited.
+ */
+function _views_distinct_field_settings_delete(ViewUI $view_ui, string $field_id, string $display_id = 'default') {
+  $third_party_settings = $view_ui->getThirdPartySetting('views_distinct', 'settings');
+  unset($third_party_settings[$display_id][$field_id]);
+  $view_ui->setThirdPartySetting('views_distinct', 'settings', $third_party_settings);
+}
+
+/**
+ * Utility function to get fields (if any) applicable.
+ *
+ * @param \Drupal\views\ViewExecutable $view
+ *   Executable view.
+ *
+ * @return array
+ *   Array of applicable fields.
+ */
+function _views_distinct_get_fields(ViewExecutable $view) {
+  $display_id = $view->current_display;
+  $view_entity = View::load($view->id());
+
+  $fields['filtered_fields'] = [
+    'pre_render' => [],
+    'post_render' => [],
+  ];
+
+  foreach ($view->field as $field_id => $field_definition) {
+    // Iterate every defined field (note: this is not every *row*, so this list
+    // is generally small.)
+    // Get views_distinct settings from the DB.
+    $settings = _views_distinct_field_settings_get($view_entity, $field_id, $display_id);
+    // Check if we should be acting on the field (there's an action assigned).
+    if (!empty($settings['filter_action'])) {
+      $filtered_row_fields = &$fields['filtered_fields']['post_render'];
+
+      if (!$settings['post_render']) {
+        // The result row key is different from $field_name in the post_execute
+        // (before render) implementation.
+        if (isset($field_definition->aliases[$field_definition->realField])) {
+          $field_id = $field_definition->aliases[$field_definition->realField];
+        }
+
+        $filtered_row_fields = &$fields['filtered_fields']['pre_render'];
+      }
+
+      // Add this field to the set of filtered duplicate fields.
+      $filtered_row_fields[$field_id] = [];
+    }
+  }
+
+  return $fields;
+}
